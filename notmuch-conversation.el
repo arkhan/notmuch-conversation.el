@@ -323,51 +323,55 @@ read-only and leaves the body editable.  Use:
   (interactive (list (and current-prefix-arg (region-active-p))))
   (when (notmuch-conversation--compose-active-p)
     (user-error "Compose area already open; send or abort first"))
-  (let* ((msg-id  (notmuch-show-get-message-id))
-         (props   (notmuch-show-get-message-properties))
-         (headers (plist-get props :headers))
-         (from    (or (plist-get headers :From) ""))
-         (date    (or (plist-get headers :Date) ""))
+  (let* ((msg-id      (notmuch-show-get-message-id))
+         (props       (notmuch-show-get-message-properties))
+         (headers     (plist-get props :headers))
+         (from        (or (plist-get headers :From) ""))
+         (date        (or (plist-get headers :Date) ""))
          ;; Fetch reply skeleton from notmuch CLI.
          (reply-plist (apply #'notmuch-call-notmuch-sexp
                              `("reply" "--format=sexp" "--format-version=5"
                                "--reply-to=all" ,msg-id)))
          (original    (plist-get reply-plist :original))
          ;; Build cited body.
-         (cited-body
-          (if (and cite-region-p (region-active-p))
-              ;; Cite only region.
-              (let ((rtxt (buffer-substring-no-properties
-                           (region-beginning) (region-end))))
-                (concat (format "On %s, %s wrote:\n" date from)
-                        (notmuch-conversation--cite-string rtxt)
-                        "\n\n"))
-            ;; Cite full message body replicating notmuch-mua-reply logic.
-            (with-temp-buffer
-              (let ((notmuch-show-insert-text/plain-hook nil)
-                    (notmuch-show-max-text-part-size 0)
-                    (notmuch-show-insert-header-p-function
-                     notmuch-mua-reply-insert-header-p-function)
-                    (notmuch-show-indent-multipart nil)
-                    (mm-inline-override-types (notmuch--inline-override-types)))
-                ;; Insert From/Date headers so notmuch-mua-cite-function can read them.
-                (insert "From: " from "\n")
-                (insert "Date: " date "\n\n")
-                (cl-letf (((symbol-function 'notmuch-crypto-insert-sigstatus-button) #'ignore)
-                          ((symbol-function 'notmuch-crypto-insert-encstatus-button) #'ignore))
-                  (notmuch-show-insert-body original (plist-get original :body) 0))
-                (set-mark (point))
-                (goto-char (point-min))
-                (funcall notmuch-mua-cite-function)
-                (buffer-substring-no-properties (point-min) (point-max))))))
+         (cited-body  (if (and cite-region-p (region-active-p))
+                          ;; Cite only the selected region.
+                          (concat (format "On %s, %s wrote:\n" date from)
+                                  (notmuch-conversation--cite-string
+                                   (buffer-substring-no-properties
+                                    (region-beginning) (region-end)))
+                                  "\n\n")
+                        ;; Cite full body, replicating notmuch-mua-reply logic.
+                        (with-temp-buffer
+                          (let ((notmuch-show-insert-text/plain-hook nil)
+                                (notmuch-show-max-text-part-size 0)
+                                (notmuch-show-insert-header-p-function
+                                 notmuch-mua-reply-insert-header-p-function)
+                                (notmuch-show-indent-multipart nil)
+                                (mm-inline-override-types
+                                 (notmuch--inline-override-types)))
+                            ;; Insert From/Date so notmuch-mua-cite-function reads them.
+                            (insert "From: " from "\n")
+                            (insert "Date: " date "\n\n")
+                            (cl-letf
+                                (((symbol-function
+                                   'notmuch-crypto-insert-sigstatus-button) #'ignore)
+                                 ((symbol-function
+                                   'notmuch-crypto-insert-encstatus-button) #'ignore))
+                              (notmuch-show-insert-body
+                               original (plist-get original :body) 0))
+                            (set-mark (point))
+                            (goto-char (point-min))
+                            (funcall notmuch-mua-cite-function)
+                            (buffer-substring-no-properties
+                             (point-min) (point-max)))))))
     (setq notmuch-conversation--compose-msg-id  msg-id
           notmuch-conversation--compose-headers reply-plist)
     (save-excursion
       (notmuch-conversation--insert-compose-area reply-plist cited-body))
-    ;; Move point to after the headers (body start).
+    ;; Move point into the editable body of the compose area.
     (goto-char (point-max))
-    (when (re-search-backward "^$"
-                              (notmuch-conversation--compose-start) t)
+    (when (re-search-backward "^$" (notmuch-conversation--compose-start) t)
       (forward-line 1))))
 
 ;;;###autoload
