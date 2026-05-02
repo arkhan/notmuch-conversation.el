@@ -212,7 +212,211 @@ Called via `notmuch-show-hook' after the buffer is fully populated."
                (overlay-put ov 'notmuch-conversation t)
                (push ov notmuch-conversation--overlays)))))))))
 
-;;; cite-region
+;;; Inline compose area
+
+(defface notmuch-conversation-compose-separator
+  '((t :inherit font-lock-comment-face :extend t))
+  "Face for the separator line between thread and compose area."
+  :group 'notmuch-conversation)
+
+(defcustom notmuch-conversation-separator
+  (make-string 72 ?-)
+  "Separator string shown between the thread and the inline compose area."
+  :type 'string
+  :group 'notmuch-conversation)
+
+(defvar-local notmuch-conversation--compose-overlay nil
+  "Overlay marking the compose area inserted at the bottom of the show buffer.")
+
+(defvar-local notmuch-conversation--compose-msg-id nil
+  "Message-id of the message being replied to inline.")
+
+(defvar-local notmuch-conversation--compose-headers nil
+  "Reply headers plist (To, Cc, Subject, From, In-Reply-To, References).")
+
+(defun notmuch-conversation--compose-active-p ()
+  "Return non-nil if an inline compose area is currently open."
+  (and notmuch-conversation--compose-overlay
+       (overlay-buffer notmuch-conversation--compose-overlay)))
+
+(defun notmuch-conversation--compose-start ()
+  "Return the start position of the compose area, or nil."
+  (when (notmuch-conversation--compose-active-p)
+    (overlay-start notmuch-conversation--compose-overlay)))
+
+(defun notmuch-conversation--compose-body-start ()
+  "Return point just after the header block in the compose area."
+  (when (notmuch-conversation--compose-active-p)
+    (save-excursion
+      (goto-char (overlay-start notmuch-conversation--compose-overlay))
+      ;; Skip separator line + blank line + header lines.
+      (re-search-forward "^$" (overlay-end notmuch-conversation--compose-overlay) t)
+      (forward-char 1)
+      (point))))
+
+(defun notmuch-conversation--remove-compose-area ()
+  "Remove the inline compose area and restore buffer read-only state."
+  (when (notmuch-conversation--compose-active-p)
+    (let ((inhibit-read-only t)
+          (start (overlay-start notmuch-conversation--compose-overlay))
+          (end   (overlay-end   notmuch-conversation--compose-overlay)))
+      (delete-overlay notmuch-conversation--compose-overlay)
+      (delete-region start end)))
+  (setq notmuch-conversation--compose-overlay nil
+        notmuch-conversation--compose-msg-id  nil
+        notmuch-conversation--compose-headers nil)
+  (setq buffer-read-only t))
+
+(defun notmuch-conversation--build-header-block (reply-plist)
+  "Return a header string built from REPLY-PLIST (:reply-headers sub-plist)."
+  (let* ((rh      (plist-get reply-plist :reply-headers))
+         (to      (or (plist-get rh :To) ""))
+         (cc      (or (plist-get rh :Cc) ""))
+         (subject (or (plist-get rh :Subject) ""))
+         (from    (or (plist-get rh :From) "")))
+    (concat
+     (format "From: %s\n" from)
+     (format "To: %s\n" to)
+     (when (and cc (not (string-empty-p cc)))
+       (format "Cc: %s\n" cc))
+     (format "Subject: %s\n" subject)
+     "\n")))
+
+(defun notmuch-conversation--insert-compose-area (reply-plist cited-body)
+  "Insert an editable compose area at the bottom of the current show buffer.
+
+REPLY-PLIST is the sexp returned by `notmuch reply --format=sexp'.
+CITED-BODY is the pre-formatted string to pre-fill as the message body."
+  (let* ((inhibit-read-only t)
+         (sep      (propertize
+                    (concat "\n" notmuch-conversation-separator "\n")
+                    'face 'notmuch-conversation-compose-separator
+                    'read-only t
+                    'rear-nonsticky '(read-only face)))
+         (header-block (notmuch-conversation--build-header-block reply-plist))
+         (header-str   (propertize header-block
+                                   'face 'message-header-other
+                                   'read-only t
+                                   'rear-nonsticky '(read-only face)))
+         (start (progn (goto-char (point-max)) (point))))
+    (insert sep header-str cited-body)
+    (setq notmuch-conversation--compose-overlay
+          (make-overlay start (point-max) nil nil t))
+    (overlay-put notmuch-conversation--compose-overlay
+                 'notmuch-conversation-compose t)
+    ;; Make buffer writable from compose-start onwards.
+    (setq buffer-read-only nil)
+    ;; Re-apply read-only to everything before compose area.
+    (put-text-property (point-min) start 'read-only t)))
+
+;;;###autoload
+(defun notmuch-conversation-reply-inline (&optional cite-region-p)
+  "Open an inline compose area at the bottom of the notmuch-show buffer.
+
+When CITE-REGION-P is non-nil (or called with prefix arg and an active
+region), cite only the selected region instead of the full message body.
+
+The compose area shows the reply headers (From/To/Cc/Subject) as
+read-only and leaves the body editable.  Use:
+  \\[notmuch-conversation-send]       to send
+  \\[notmuch-conversation-abort-compose] to discard"
+  (interactive (list (and current-prefix-arg (region-active-p))))
+  (when (notmuch-conversation--compose-active-p)
+    (user-error "Compose area already open; send or abort first"))
+  (let* ((msg-id  (notmuch-show-get-message-id))
+         (props   (notmuch-show-get-message-properties))
+         (headers (plist-get props :headers))
+         (from    (or (plist-get headers :From) ""))
+         (date    (or (plist-get headers :Date) ""))
+         ;; Fetch reply skeleton from notmuch CLI.
+         (reply-plist (apply #'notmuch-call-notmuch-sexp
+                             `("reply" "--format=sexp" "--format-version=5"
+                               "--reply-to=all" ,msg-id)))
+         (original    (plist-get reply-plist :original))
+         ;; Build cited body.
+         (cited-body
+          (if (and cite-region-p (region-active-p))
+              ;; Cite only region.
+              (let ((rtxt (buffer-substring-no-properties
+                           (region-beginning) (region-end))))
+                (concat (format "On %s, %s wrote:\n" date from)
+                        (notmuch-conversation--cite-string rtxt)
+                        "\n\n"))
+            ;; Cite full message body via notmuch-show-insert-body.
+            (concat
+             (format "On %s, %s wrote:\n" date from)
+             (with-temp-buffer
+               (let ((notmuch-show-insert-text/plain-hook nil)
+                     (notmuch-show-max-text-part-size 0)
+                     (notmuch-show-indent-multipart nil))
+                 (notmuch-show-insert-body
+                  original (plist-get original :body) 0)
+                 (funcall notmuch-mua-cite-function)
+                 (buffer-substring-no-properties (point-min) (point-max))))
+             "\n"))))
+    (setq notmuch-conversation--compose-msg-id  msg-id
+          notmuch-conversation--compose-headers reply-plist)
+    (save-excursion
+      (notmuch-conversation--insert-compose-area reply-plist cited-body))
+    ;; Move point to after the headers (body start).
+    (goto-char (point-max))
+    (when (re-search-backward "^$"
+                              (notmuch-conversation--compose-start) t)
+      (forward-line 1))))
+
+;;;###autoload
+(defun notmuch-conversation-abort-compose ()
+  "Discard the inline compose area without sending."
+  (interactive)
+  (unless (notmuch-conversation--compose-active-p)
+    (user-error "No inline compose area is open"))
+  (when (yes-or-no-p "Discard inline reply? ")
+    (notmuch-conversation--remove-compose-area)
+    (goto-char (point-max))
+    (message "Reply discarded.")))
+
+;;;###autoload
+(defun notmuch-conversation-send ()
+  "Send the message composed in the inline compose area.
+
+Collects the headers and body from the compose area, opens a
+`message-mode' buffer, inserts everything, and calls `message-send-and-exit'."
+  (interactive)
+  (unless (notmuch-conversation--compose-active-p)
+    (user-error "No inline compose area to send"))
+  (let* ((compose-start (notmuch-conversation--compose-start))
+         (compose-end   (point-max))
+         ;; Extract body: everything after the blank line following headers.
+         (body-start    (save-excursion
+                          (goto-char compose-start)
+                          (if (re-search-forward "^$" compose-end t)
+                              (progn (forward-char 1) (point))
+                            compose-end)))
+         (body-text     (buffer-substring-no-properties body-start compose-end))
+         (rh            (plist-get notmuch-conversation--compose-headers
+                                   :reply-headers))
+         (to            (or (plist-get rh :To) ""))
+         (cc            (plist-get rh :Cc))
+         (subject       (or (plist-get rh :Subject) ""))
+         (extra-headers (notmuch-headers-plist-to-alist rh))
+         (msg-id        notmuch-conversation--compose-msg-id)
+         (show-buf      (current-buffer)))
+    ;; Remove compose area before opening message buffer to avoid confusion.
+    (notmuch-conversation--remove-compose-area)
+    ;; Open message buffer using notmuch's mail function.
+    (notmuch-mua-mail to subject extra-headers nil (notmuch-mua-get-switch-function))
+    ;; Insert body.
+    (message-goto-body)
+    (insert body-text)
+    ;; Queue replied tag change.
+    (when notmuch-message-replied-tags
+      (setq notmuch-message-queued-tag-changes
+            (list (cons msg-id notmuch-message-replied-tags))))
+    (set-buffer-modified-p nil)
+    (message "Ready to send — use %s or M-x message-send-and-exit."
+             (substitute-command-keys "\\[message-send-and-exit]"))))
+
+;;; cite-region (standalone — opens normal compose window)
 
 (defun notmuch-conversation--cite-string (text)
   "Return TEXT cited with `notmuch-conversation-cite-prefix'."
@@ -268,34 +472,44 @@ selected region."
 
 ;;; Minor mode
 
-(defvar notmuch-conversation-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "R") #'notmuch-conversation-cite-region)
-    map)
-  "Keymap for `notmuch-conversation-mode' (active in notmuch-show buffers).")
-
 ;;;###autoload
 (define-minor-mode notmuch-conversation-mode
-  "Global minor mode adding sender colors and cite-region to notmuch-show.
+  "Global minor mode adding sender colors and inline compose to notmuch-show.
 
 When enabled:
 - Each unique sender in a thread is highlighted with a distinct color.
-- \"R\" in notmuch-show opens a reply citing only the selected region."
+- \"r\" opens an inline compose area at the bottom of the show buffer.
+- \"R\" (with active region) cites only the selected text inline.
+- \"C-c C-c\" in the compose area sends the message.
+- \"C-c C-k\" discards the compose area."
   :global t
   :group 'notmuch-conversation
   :lighter " NConv"
   (if notmuch-conversation-mode
       (progn
         (add-hook 'notmuch-show-hook #'notmuch-conversation--apply-colors)
+        (define-key notmuch-show-mode-map (kbd "r")
+                    #'notmuch-conversation-reply-inline)
         (define-key notmuch-show-mode-map (kbd "R")
-                    #'notmuch-conversation-cite-region))
+                    (lambda ()
+                      (interactive)
+                      (notmuch-conversation-reply-inline t)))
+        (define-key notmuch-show-mode-map (kbd "C-c C-c")
+                    #'notmuch-conversation-send)
+        (define-key notmuch-show-mode-map (kbd "C-c C-k")
+                    #'notmuch-conversation-abort-compose))
     (remove-hook 'notmuch-show-hook #'notmuch-conversation--apply-colors)
+    (define-key notmuch-show-mode-map (kbd "r") nil)
     (define-key notmuch-show-mode-map (kbd "R") nil)
-    ;; Clean up overlays in all show buffers.
+    (define-key notmuch-show-mode-map (kbd "C-c C-c") nil)
+    (define-key notmuch-show-mode-map (kbd "C-c C-k") nil)
+    ;; Clean up overlays and compose areas in all show buffers.
     (dolist (buf (buffer-list))
       (with-current-buffer buf
         (when (eq major-mode 'notmuch-show-mode)
-          (notmuch-conversation--clear-overlays))))))
+          (notmuch-conversation--clear-overlays)
+          (when (notmuch-conversation--compose-active-p)
+            (notmuch-conversation--remove-compose-area)))))))
 
 (provide 'notmuch-conversation)
 ;;; notmuch-conversation.el ends here
