@@ -342,18 +342,24 @@ read-only and leaves the body editable.  Use:
                 (concat (format "On %s, %s wrote:\n" date from)
                         (notmuch-conversation--cite-string rtxt)
                         "\n\n"))
-            ;; Cite full message body via notmuch-show-insert-body.
-            (concat
-             (format "On %s, %s wrote:\n" date from)
-             (with-temp-buffer
-               (let ((notmuch-show-insert-text/plain-hook nil)
-                     (notmuch-show-max-text-part-size 0)
-                     (notmuch-show-indent-multipart nil))
-                 (notmuch-show-insert-body
-                  original (plist-get original :body) 0)
-                 (funcall notmuch-mua-cite-function)
-                 (buffer-substring-no-properties (point-min) (point-max))))
-             "\n"))))
+            ;; Cite full message body replicating notmuch-mua-reply logic.
+            (with-temp-buffer
+              (let ((notmuch-show-insert-text/plain-hook nil)
+                    (notmuch-show-max-text-part-size 0)
+                    (notmuch-show-insert-header-p-function
+                     notmuch-mua-reply-insert-header-p-function)
+                    (notmuch-show-indent-multipart nil)
+                    (mm-inline-override-types (notmuch--inline-override-types)))
+                ;; Insert From/Date headers so notmuch-mua-cite-function can read them.
+                (insert "From: " from "\n")
+                (insert "Date: " date "\n\n")
+                (cl-letf (((symbol-function 'notmuch-crypto-insert-sigstatus-button) #'ignore)
+                          ((symbol-function 'notmuch-crypto-insert-encstatus-button) #'ignore))
+                  (notmuch-show-insert-body original (plist-get original :body) 0))
+                (set-mark (point))
+                (goto-char (point-min))
+                (funcall notmuch-mua-cite-function)
+                (buffer-substring-no-properties (point-min) (point-max))))))
     (setq notmuch-conversation--compose-msg-id  msg-id
           notmuch-conversation--compose-headers reply-plist)
     (save-excursion
@@ -396,11 +402,9 @@ Collects the headers and body from the compose area, opens a
          (rh            (plist-get notmuch-conversation--compose-headers
                                    :reply-headers))
          (to            (or (plist-get rh :To) ""))
-         (cc            (plist-get rh :Cc))
          (subject       (or (plist-get rh :Subject) ""))
          (extra-headers (notmuch-headers-plist-to-alist rh))
-         (msg-id        notmuch-conversation--compose-msg-id)
-         (show-buf      (current-buffer)))
+         (msg-id        notmuch-conversation--compose-msg-id))
     ;; Remove compose area before opening message buffer to avoid confusion.
     (notmuch-conversation--remove-compose-area)
     ;; Open message buffer using notmuch's mail function.
